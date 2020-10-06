@@ -21,10 +21,12 @@
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
 #include "llvm/Frontend/OpenMP/OMPIRBuilder.h"
 #include "llvm/IR/CallSite.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/Utils/CallGraphUpdater.h"
+#include <algorithm>
 
 using namespace llvm;
 using namespace omp;
@@ -61,14 +63,23 @@ struct OpenMPOpt {
     OMPBuilder.initialize();
   }
 
-  /// Loop fusion
-  struct OMPLoopFusion{
-    //
-	  std::map<CallInst*, CallInst*> call_init_fini_mapping;
-	  std::map<CallInst*, std::vector<CallInst*>> call_map;
-	  std::map<Value*, Value*> store_op0_op1;
-	  std::map<Value*, Value*> args_map;	  
-	  CallInst* current_call_init_instruction;
+  /// Data structure to hold information for the  deleting
+  /// redundent OpenMP for loop calls
+  struct OMPLoopFusion {
+    bool check=false;
+    /// Keeps map of __kmpc_static_init4 and its __kmpc_static_fini calls for each OpenMP for loop
+    std::map<CallInst *, CallInst *> call_init_fini_mapping;
+    std::map<CallInst *, BasicBlock*> call_basicblock_mapping;
+    /// Keeps map of __kmpc_static_init4 and  all its compatilable __kmpc_static_init4 in a vector
+    std::map<CallInst *, std::vector<CallInst *>> call_map;
+    std::map<CallInst *, std::vector<Value *>> call_arg;
+    /// the data structure maintain the basic blocks in a lineage
+    std::map<BasicBlock*, std::vector<BasicBlock*>> chain;
+    std::vector<BasicBlock*> visited, loopVisited;
+    /// store_op0_op01 keeps map of operand 1 and operand 0
+    /// args_map keeps map of arguments of __kmpc_static_init4 for later cleaning
+    std::map<Value *, Value *> store_op0_op1, args_map;
+    CallInst *current_call_init_instruction = nullptr;
   };
 
   /// Generic information that describes a runtime function
@@ -112,128 +123,314 @@ struct OpenMPOpt {
           It.second.erase(U);
       }
     }
-
-
   };
 
   /// Run all OpenMP optimizations on the underlying SCC/ModuleSlice.
   bool run() {
     bool Changed = false;
-
     LLVM_DEBUG(dbgs() << TAG << "Run on SCC with " << SCC.size()
                       << " functions in a slice with " << ModuleSlice.size()
                       << " functions\n");
 
     Changed |= deduplicateRuntimeCalls();
     Changed |= deleteParallelRegions();
-    Changed |= runTheOMPLoopFusion();
+    Changed |= deleteStaticScheduleCalls();
 
     return Changed;
   }
 
 private:
-
-  /// Try to fuse OpenMP for loop with static scheduling
-  /// check if all parameters are same and the loops are adjacent 
-  /// the two for loops can be used
-
-  bool runTheOMPLoopFusion(){
-	bool Changed = false;  
-	
-	for (Function *F : SCC) {
-		OMPLoopFusion OLF;
-		runOverTheBlock(F, &OLF);
-		Changed = checkTheCompatibility(&OLF);
-		errs() << *(OLF.current_call_init_instruction)<<"\n";
-	}
-	return Changed;
+  /// Combine "OpenMP for loop with static scheduling"
+  /// check if all parameters are same and the loops are adjacent
+  /// See https://openmp.llvm.org/Reference.pdf. See section 5.8.3.24 for parameters
+  /// The two for loops can share the same __kmpc_static_init4() and __kmpc_static_fini()
+  /// calls.
+    
+  bool deleteStaticScheduleCalls() {
+    bool Changed = false;
+    // if there is no kmpc_for_static_init_4, there is  no need to do anything
+    RuntimeFunctionInfo &RFI = RFIs[OMPRTL___kmpc_for_static_init_4];
+    if (!RFI.Declaration)
+        return Changed;
+    // Else go through each function
+    OMPLoopFusion OLF;
+    for (Function *F : SCC)
+        Changed = runOverTheBlock(*F, &OLF);
+    return Changed;
   }
+    
+// Check the compatility of the of the __kmpc_for_static_init_4
+    void checkTheCompatibility(OMPLoopFusion *OLF){
+        bool compatible = true;
+        for (auto itr : OLF->call_init_fini_mapping) {
+          if (find(itr.first, OLF->call_map)) continue;
+          std::vector<CallInst *> v;
+          std::vector<Value *> v1;
+          for (Value *arg : (itr.first)->args())
+                v1.push_back(arg);
+          for (auto itr1 : OLF->call_init_fini_mapping) {
+            if ((itr.first) == (itr1.first)) continue;
+            if (find(itr1.first, OLF->call_map)) continue;
+            std::vector<Value *> v2;
+            for (Value *arg2 : (itr1.first)->args())
+                v2.push_back(arg2);
+            for (auto i = v1.begin(), j = v2.begin(); i != v1.end() && j != v2.end(); ++i, ++j) {
+                if (isa<Constant>(*i) && isa<Constant>(*j)) {
+                  if (*i != *j) {compatible = false; break;}
+                }
+                else {
+                  if (OLF->store_op0_op1.find(*j)->second != OLF->store_op0_op1.find(*i)->second) {
+                    compatible = false; break;}
+                }
+              }
+            if (compatible) {
+                for (auto i = v1.begin(), j = v2.begin(); i != v1.end() && j != v2.end(); ++i, ++j) {
+                    OLF->args_map.insert({*j,*i});
+                }
+                v.push_back(itr1.first);
+              }
+              else break; /// the adjacent for omp loop is not compatible so there is no need to check others
+               ///  therefore we need to break out of the second for loop
+          }
+            /// if a call instruction has some compatible call instructions then put in the call_map container
+             OLF->call_map.insert({itr.first, v});
+            ///  make the flag  true again for the next  instruction checking
+            if (!compatible) compatible = true;
+            v.clear();
+        }
+    }
+    
+    bool checkForOMPInit(BasicBlock*  B){
+        if (!B) return false;
+        for (BasicBlock::iterator BBI=B->begin(); BBI !=B->end(); ++BBI){
+            if (CallInst *c= dyn_cast<CallInst>(BBI)){
+                if (c->getCalledFunction()->getName()=="__kmpc_for_static_init_4"){
+                    return true;}
+                }
+            }
+        return false;
+    }
+    
+    bool checkForOMPFini(BasicBlock*  B){
+        if  (!B) return false;
+        for (BasicBlock::iterator BBI=B->begin(); BBI !=B->end(); ++BBI){
+            if (CallInst *c= dyn_cast<CallInst>(BBI)){
+                if (c->getCalledFunction()->getName()=="__kmpc_for_static_fini"){
+                    return true;}
+                }
+            }
+        return false;
+    }
+    
+    void markNodeVisited(BasicBlock* B,std::vector <BasicBlock *> &v,OMPLoopFusion *OLF){
+        if (!B) return;
+        OLF->visited.push_back(B);
+        v.push_back(B);
+        for ( auto BB: successors(B)){
+            if (find(OLF->visited,BB)) continue;
+            markNodeVisited(BB,v, OLF);
+        }
+    }
+    
+    BasicBlock* checkTheLoop(BasicBlock* B,std::vector <BasicBlock *> &v, OMPLoopFusion *OLF){
+        std::vector<BasicBlock*> v2;
+        for (auto S: successors(B)){
+            if (checkLoop(S, B, v2)) {
+                // mark all the node as visited
+                markNodeVisited(S,v,OLF);
+                return  nullptr;}
+            else
+                return S;
+        }
+        return nullptr;
+    }
+    
+    bool checkLoop(BasicBlock* S, BasicBlock* B, std::vector<BasicBlock*>& visit){
+        bool loop = false;
+        if (!S) return loop;
+        for (auto BB: successors(S)){
+            if (BB == B) {loop = true; break;}
+            if (find(visit, BB)) continue;
+            visit.push_back(BB);
+            loop = (loop || checkLoop (BB, B, visit));
+        }
+        return loop;
+    }
+    
+    
+    int countSuccessors(BasicBlock* B){
+        int count = 0;
+        for (auto BS: successors(B)) // I should use iterator instead
+            count++;
+        return count;
+    }
+    int countPredessors(BasicBlock* B){
+        int count = 0;
+        for (auto BP: predecessors(B))
+            count++;
+        return count;
+    }
+    void makeLineage(BasicBlock *B, std::vector <BasicBlock *> &v, OMPLoopFusion *OLF){
+        if (!B or find(OLF->visited, B) ) return;
+        if ((countSuccessors(B) <=1 )   && (countPredessors(B) > 1)) return; // unique entrance with two control flows
+        if ((countPredessors(B) <=1 ) && (countSuccessors(B)) > 1) return; // two control flows merging into a unique point
+        // these points can not  be part  of lineage for the optimizations
+        BasicBlock* t=nullptr;
+        // If you  have a basic blokc try to find the omp for starting point
+        if (B->getSingleSuccessor()){
+            OLF->visited.push_back(B);
+            v.push_back(B);
+            if  (checkForOMPInit(B)) // if you find it then find the end points ; all inbetween points are are part of the lineage
+                t=checkOMPForLoop(B->getSingleSuccessor(), v, OLF);// the output is the basicblock for building the lineage
+            else
+                t=B->getSingleSuccessor();}// else take the  successor and move on
+        else {// if you have a codition with more than two successors and predecessors
+            // we need to check if they are control points or inbetween for loops
+                OLF->visited.push_back(B);
+                t = checkTheLoop(B, v, OLF) ;
+                v.push_back(B);
+        }
+        makeLineage(t, v, OLF);
+        return;
+    }
 
-  /// 
-  //
-  bool find(CallInst* I, std::map<CallInst*, std::vector<CallInst*>> m){
-	if (m.size() == 0) return false;
-	for ( auto itr = m.begin(); itr!=m.end(); ++itr){
-		if ((itr->second).size()==0) continue;
-		else{
-			for ( auto itr1=(itr->second).begin(); itr1!=(itr->second).end(); ++itr1){
-				if (I == *itr1) return true;
-			}
-		}
-	}
-	return false;
-}
+    
+    BasicBlock* checkOMPForLoop(BasicBlock *BB,std::vector <BasicBlock *> &v, OMPLoopFusion *OLF){
+        BasicBlock * t = nullptr;
+        if (!BB) return t;
+        OLF->visited.push_back(BB);
+        v.push_back(BB);
+        for (auto B: successors(BB)){
+           if (find(OLF->visited, B)) continue;
+           if (checkForOMPFini(B)) { t= B; continue;}
+           checkOMPForLoop (B, v, OLF);
+        }
+        return t;
+    }
+   
+    
+    bool find(std::vector <BasicBlock*> b, BasicBlock* B){
+        for ( auto t: b)
+            if (t == B)  return true;
+        return false;
+    }
+    
+    bool find(CallInst *I, std::map<CallInst *, std::vector<CallInst *>> m) {
+        for (auto itr :m){
+            if (itr.first== I) return true;
+         for (auto itr1 : (itr.second))
+             if (I == itr1) return true;
+        }
+       return false;
+    }
+    
+    void clean_intrinsic_calls(BasicBlock* B, OMPLoopFusion *OLF){
+        std::vector<Instruction *> remove;
+        for (BasicBlock::iterator DI = B->begin(); DI != B->end(); ++DI ) {
+            if (IntrinsicInst *II = dyn_cast<IntrinsicInst> (DI)){
+                if (II->getIntrinsicID() == Intrinsic::lifetime_start || II->getIntrinsicID() == Intrinsic::lifetime_end ){
+                    remove.push_back(II);
+                    }
+                }
+            }
+        for (auto r: remove)
+            r->eraseFromParent();
+    }
+    
+    void check_call_instructions(BasicBlock* B, OMPLoopFusion *OLF){
+        for (BasicBlock::iterator DI = B->begin(); DI != B->end(); ++DI ) {
+            if (CallInst *c = dyn_cast<CallInst>(DI)) {
+              if (c->getCalledFunction()->getName() == "__kmpc_for_static_init_4")
+                OLF->current_call_init_instruction = c;
+              if (c->getCalledFunction()->getName() == "__kmpc_for_static_fini")
+                OLF->call_init_fini_mapping.insert({OLF->current_call_init_instruction, c});
+            }
+            if (StoreInst *store = dyn_cast<StoreInst>(DI))
+                OLF->store_op0_op1.insert({store->getOperand(1), store->getOperand(0)});
+          }
+    }
+                                 
+    bool runOverTheBlock(Function &F, OMPLoopFusion *OLF) {
+        std::vector <BasicBlock *> v;
+        bool changed = false;
+         for (auto &BB: F) {
+             // on each  block prepare data structure for the instructions
+             if (find (OLF->visited, &BB)) continue;
+             makeLineage (&BB, v, OLF);
+             OLF->chain.insert({&BB,v});
+             v.clear();
+         }
+        changed = doTheOptimization(OLF);// act  on the formed lineages
+        
+        return changed;
+    }
+     
+    bool doTheOptimization(OMPLoopFusion *OLF){
+        bool changed = false;
+        for (auto S: OLF->chain){
+            //we have todo it for each lineage
+            //B is a basic block in a lineage
+            for ( auto B:S.second){
+                check_call_instructions(B, OLF);
+            }
+            checkTheCompatibility(OLF);
+            changed = cleanInstructions(OLF);
+            if (changed)
+                for (auto B:S.second){
+                    replace_UseValues(B, OLF);
+                    clean_intrinsic_calls(B, OLF);
+                }
+            OLF->call_init_fini_mapping.clear();
+            OLF->call_map.clear();
+            OLF->store_op0_op1.clear();
+            OLF->args_map.clear();
+            
+        }
+        return changed;
+    }
+    
+    void replace_UseValues(BasicBlock* B, OMPLoopFusion *OLF){
+        std::vector<Instruction *> remove;
+        for (BasicBlock::iterator II = B->begin(); II != B->end(); ++II) {
+            Instruction *It = dyn_cast<Instruction>(II);
+            if (isa<CallInst>(It)) continue;
+            for (unsigned int k = 0; k < It->getNumOperands(); k++){
+                auto temp =  OLF->args_map.find(It->getOperand(k));
+                if (temp != OLF->args_map.end()){
+                    It->setOperand(k, temp->second);
+                    if (isa<StoreInst>(It) && k > 0) remove.push_back(It);
+                    }
+            }
+        }
+        for (auto r: remove)
+                r->eraseFromParent();
+    }
+    
+    bool cleanInstructions(OMPLoopFusion *OLF) {
+      bool changed = false;
+      for (auto itr : OLF->call_map) {
+        int count = (itr.second).size();
+        if (!count) continue;
+        Instruction *I = OLF->call_init_fini_mapping.find(itr.first)->second;
+        I->eraseFromParent();
+        changed = true;
+        for (auto itr1:itr.second) {
+          Instruction *I1 = itr1;
+          Instruction *I2 = OLF->call_init_fini_mapping.find(itr1)->second;
+          I1->eraseFromParent();
+          if (count == 1) break;
+          I2->eraseFromParent();
+          count--;
+          }
+        }
+      return changed;
+    }
+  
 
-
-
-  /// The following functions check the compatibility of the 
-  //  __kmpc_for_static_init_4 call instructions for the fusion
-
-  bool checkTheCompatibility( OMPLoopFusion* OLF){
-	bool compatible = true;
-	for (auto itr = OLF->call_init_fini_mapping.begin(); itr!= OLF->call_init_fini_mapping.end(); ++itr){
-		std::vector <CallInst*> v;
-		if (find(itr->first, OLF->call_map)) continue;
-		for (auto itr1 = itr; itr1!=OLF->call_init_fini_mapping.end(); ++itr1){
-			if (itr == itr1) continue;
-			else {
-				std::vector<Value*> v1, v2;
-					for (Value* arg : (itr->first)->args()){
-						v1.push_back(arg);
-					}
-					for (Value* arg2 : (itr1->first)->args()){
-						v2.push_back(arg2);
-					}
-					for (auto i = v1.begin(), j=v2.begin(); i!=v1.end() && j!=v2.end(); ++i, ++j)
-					{
-
-						if (isa<Constant>(*i) && isa<Constant>(*j))	{
-							if (*i != *j){
-								compatible=false; break;
-							}
-						}
-						else{ // we have a pointer argument
-							if (OLF->store_op0_op1.find(*j)->second != OLF->store_op0_op1.find(*i)->second){
-								compatible=false; break;
-							}
-						}
-					}
-					if (compatible) v.push_back(itr1->first);
-					else break;
-			}
-		}
-
-		OLF->call_map.insert({itr->first, v});
-		if (!compatible) {compatible=true;}
-
-	}	
-	 return false;
+/// does function printing
+void printFunction(Function &F) {
+    F.print(errs(), nullptr);
   }
-
-
-
-
-  /// The function goes through each BB and check the call instructions
-  /// __kmpc_for_static_init_4 and __kmpc_for_static_fini
-  /// store the operands of the store instructios   
-  void runOverTheBlock( Function *F, OMPLoopFusion* OLF){
-	  	for (Function::iterator FI=F->begin(); FI!=F->end();++FI){
-		  for (BasicBlock::iterator BBI=FI->begin(); BBI!=FI->end();++BBI){
-			  if (CallInst *c = dyn_cast<CallInst> (BBI)){
-					 if  (c->getCalledFunction()->getName() == "__kmpc_for_static_init_4"){
-				  		OLF->current_call_init_instruction = c;
-			 	 		} 
-			  		 else if (c->getCalledFunction()->getName() == "__kmpc_for_static_fini") {
-				 		 OLF->call_init_fini_mapping.insert({OLF->current_call_init_instruction, c});
-			  			}		
-			  else if (StoreInst *store = dyn_cast<StoreInst>(BBI)){
-				  OLF->store_op0_op1.insert({store->getOperand(1),store->getOperand(0)});
-			  	}
-			}
-		}
-	}
-  }
-
 
   /// Try to delete parallel regions if possible
   bool deleteParallelRegions() {
